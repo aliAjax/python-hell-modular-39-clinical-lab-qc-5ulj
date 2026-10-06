@@ -109,7 +109,15 @@ def _validate_qc_run(actor, data, lookup):
         value = float(data.get("value"))
     except (TypeError, ValueError):
         raise ValidationError("qc result value must be numeric")
-    return {"value": value}
+    extra = {}
+    if data.get("session_id") is not None and str(data.get("session_id")).strip():
+        extra["session_id"] = str(data["session_id"])
+    if data.get("sequence_no") is not None:
+        try:
+            extra["sequence_no"] = int(data["sequence_no"])
+        except (TypeError, ValueError):
+            raise ValidationError("sequence_no must be an integer")
+    return {"value": value, **extra}
 
 
 def _validate_result_batch(actor, data, lookup):
@@ -235,6 +243,7 @@ class RuleEngine:
         },
         "result_batch": {
             "release": (("waiting",), "released"),
+            "recall": (("released",), "intercepted"),
             "intercept": (("waiting",), "intercepted"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
@@ -291,6 +300,7 @@ class RuleEngine:
         "resolve": ("supervisor", "admin"),
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
+        "recall": ("operator", "supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {

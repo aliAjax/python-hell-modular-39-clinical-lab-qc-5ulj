@@ -54,6 +54,27 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS instrument_sessions (
+                    instrument_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(instrument_id, session_id)
+                );
+                CREATE TABLE IF NOT EXISTS staged_qc_run (
+                    instrument_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    sequence_no INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    qc_run_id TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(instrument_id, session_id, sequence_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_staged_qc_run_status
+                    ON staged_qc_run(instrument_id, session_id, status);
             """)
 
     @staticmethod
@@ -195,6 +216,100 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def upsert_session(self, instrument_id, session_id, actor_id):
+        """Record that an instrument upload session exists; idempotent."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO instrument_sessions(instrument_id, session_id, created_by, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(instrument_id, session_id) DO NOTHING",
+                (instrument_id, session_id, actor_id, utcnow()),
+            )
+
+    def list_sessions(self, instrument_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT instrument_id, session_id, created_by, created_at "
+                "FROM instrument_sessions WHERE instrument_id = ? ORDER BY created_at, session_id",
+                (instrument_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def apply_staged_run(self, instrument_id, session_id, sequence_no, raw_payload,
+                         entity_id, entity_status, entity_data, actor_id):
+        """Atomically claim a staged record and create its qc_run entity.
+
+        Returns ("applied", entity_id) when this call created the run, or
+        ("exists", None) when a concurrent/previous call already applied it.
+        """
+        now = utcnow()
+        payload = json.dumps(raw_payload, ensure_ascii=False, sort_keys=True)
+        entity_payload = json.dumps(entity_data, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT OR IGNORE INTO staged_qc_run"
+                    "(instrument_id, session_id, sequence_no, payload, status, qc_run_id, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+                    (instrument_id, session_id, sequence_no, payload, now, now),
+                )
+                row = connection.execute(
+                    "SELECT status FROM staged_qc_run "
+                    "WHERE instrument_id = ? AND session_id = ? AND sequence_no = ?",
+                    (instrument_id, session_id, sequence_no),
+                ).fetchone()
+                if row and row["status"] == "applied":
+                    connection.rollback()
+                    return "exists", None
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, 'qc_run', ?, 1, ?, ?, ?, ?)",
+                    (entity_id, entity_status, entity_payload, actor_id, now, now),
+                )
+                connection.execute(
+                    "UPDATE staged_qc_run SET status = 'applied', qc_run_id = ?, error = NULL, updated_at = ? "
+                    "WHERE instrument_id = ? AND session_id = ? AND sequence_no = ?",
+                    (entity_id, now, instrument_id, session_id, sequence_no),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return "applied", entity_id
+
+    def mark_staged_failed(self, instrument_id, session_id, sequence_no, raw_payload, error):
+        """Persist a per-record failure so a later retry can resume from it.
+
+        An already-applied record is never overwritten.
+        """
+        now = utcnow()
+        payload = json.dumps(raw_payload, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO staged_qc_run"
+                "(instrument_id, session_id, sequence_no, payload, status, qc_run_id, error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'failed', NULL, ?, ?, ?) "
+                "ON CONFLICT(instrument_id, session_id, sequence_no) DO UPDATE "
+                "SET status = 'failed', error = excluded.error, qc_run_id = NULL, updated_at = excluded.updated_at "
+                "WHERE staged_qc_run.status != 'applied'",
+                (instrument_id, session_id, sequence_no, payload, str(error), now, now),
+            )
+
+    def list_staged(self, instrument_id, session_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT instrument_id, session_id, sequence_no, payload, status, qc_run_id, error, created_at, updated_at "
+                "FROM staged_qc_run WHERE instrument_id = ? AND session_id = ? ORDER BY sequence_no",
+                (instrument_id, session_id),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            result.append(item)
+        return result
 
     def ping(self):
         with self._connect() as connection:
