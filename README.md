@@ -34,6 +34,23 @@ python3 app.py --db ./data.db --port 8339
 
 身份通过`X-User-Id`和`X-Role`请求头传入。可选`Idempotency-Key`防止重复创建。
 
+## 仪器断网暂存与回传
+
+仪器断网期间质控结果留在机内，回网后批量回传。机内序号每次上电都会从0重来，因此记录身份为`(仪器, 本次会话号, 机内序号)`，回传必须带`session_id`。
+
+- `POST /api/instruments/<instrument_id>/qc-buffer-uploads`：请求体`{"session_id": "...", "records": [{"seq": 0, "assay_id", "qc_lot_id", "value", "run_at"}, ...]}`，角色为`operator`及以上。
+- `GET /api/instruments/<instrument_id>/qc-buffer-uploads`：列出该仪器的回传会话。
+- `GET /api/instruments/<instrument_id>/qc-buffer-uploads/<session_id>`：查看会话状态与断点（`status`、`last_seq`、`total`、`last_error`）。
+
+语义：
+
+- 每条记录独立提交并推进`last_seq`检查点；中途失败后用同一会话号和相同载荷重试，已入序号自动跳过，从断点继续。
+- 两个操作员同时提交同一台仪器的同一会话不会入库两次：写入在数据库事务内按`(instrument_id, session_id, seq)`去重，重复序号但内容不同返回`409 ConflictError`。
+- 补录按观测时刻`run_at`插回时间线（而非到达顺序），连续偏差与趋势判定基于完整时间线计算。
+- 每次回传后级联重算该仪器各质控品批次的全部已判定运行；结论或标志变化时覆盖判定、版本递增并写`cascade_evaluate`审计。
+- 已放行的`result_batch`，若其依据的质控运行由accepted翻转为rejected，自动退回`intercepted`（审计动作为`intercept`，操作者为`system:cascade`，`data.pullback`记录翻转依据），需按既有流程复测/调查后才能放行后续批次。
+- 手工`correct`一条质控结果同样触发上述级联重算。
+
 ## 测试
 
 ```bash

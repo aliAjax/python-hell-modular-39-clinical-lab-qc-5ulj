@@ -1,7 +1,7 @@
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .domain import (
     Actor,
@@ -86,6 +86,21 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if (
+                    len(parts) >= 4
+                    and parts[:2] == ["api", "instruments"]
+                    and parts[3] == "qc-buffer-uploads"
+                ):
+                    if len(parts) == 4:
+                        return self._send(
+                            200,
+                            {"items": service.list_upload_sessions(parts[2])},
+                        )
+                    if len(parts) == 5:
+                        return self._send(
+                            200,
+                            service.get_upload_session(parts[2], unquote(parts[4])),
+                        )
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
@@ -137,6 +152,21 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if (
+                    len(parts) == 4
+                    and parts[:2] == ["api", "instruments"]
+                    and parts[3] == "qc-buffer-uploads"
+                ):
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.upload_qc_buffer(
+                            actor,
+                            parts[2],
+                            body.get("session_id"),
+                            body.get("records"),
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()

@@ -12,6 +12,23 @@ def calibration_is_valid(calibration_due, as_of):
     return str(calibration_due)[:10] >= str(as_of)[:10]
 
 
+def timeline_key(run):
+    """Ordering position of a QC run on the observation timeline.
+
+    Backfilled onboard records arrive late but must be inserted at their
+    observation time, so every rule evaluation orders by run_at; the session
+    sequence and entity id only break ties for identical timestamps in a
+    stable way.
+    """
+    data = run.get("data", run)
+    return (
+        str(data.get("run_at", "")),
+        str(data.get("session_id") or ""),
+        int(data.get("seq", 0) or 0),
+        str(run.get("id", "")),
+    )
+
+
 def evaluate_qc(history, value, target, sd, config=None):
     """Evaluate one QC value against numeric and multi-rule criteria."""
     config = dict(config or {})
@@ -135,7 +152,7 @@ def _validate_evaluate(actor, entity, data, lookup):
             continue
         if run["data"].get("qc_lot_id") != entity["data"].get("qc_lot_id"):
             continue
-        if str(run["data"].get("run_at", "")) < str(entity["data"].get("run_at", "")):
+        if timeline_key(run) < timeline_key(entity):
             previous.append(run["data"]["value"])
     result = evaluate_qc(
         previous,
@@ -235,7 +252,7 @@ class RuleEngine:
         },
         "result_batch": {
             "release": (("waiting",), "released"),
-            "intercept": (("waiting",), "intercepted"),
+            "intercept": (("waiting", "released"), "intercepted"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),

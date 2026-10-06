@@ -54,6 +54,27 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS qc_upload_sessions (
+                    instrument_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    last_seq INTEGER NOT NULL DEFAULT 0,
+                    submitted_by TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(instrument_id, session_id)
+                );
+                CREATE TABLE IF NOT EXISTS qc_buffer_records (
+                    instrument_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    run_entity_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(instrument_id, session_id, seq)
+                );
             """)
 
     @staticmethod
@@ -194,6 +215,150 @@ class SQLiteRepository:
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
+            )
+
+    def start_upload_session(self, instrument_id, session_id, total, actor_id):
+        """Ensure an upload session exists and mark it processing.
+
+        Returns the stored session row. Concurrent submissions of the same
+        (instrument, session) serialize here; the loser sees the existing row
+        and must resume from its checkpoint instead of inserting twice.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM qc_upload_sessions WHERE instrument_id = ? AND session_id = ?",
+                (instrument_id, session_id),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO qc_upload_sessions(instrument_id, session_id, status, total, last_seq, "
+                    "submitted_by, last_error, created_at, updated_at) VALUES (?, ?, 'processing', ?, 0, ?, NULL, ?, ?)",
+                    (instrument_id, session_id, int(total), actor_id, now, now),
+                )
+            elif row["status"] == "completed":
+                connection.commit()
+                return self._session_from_row(row)
+            else:
+                connection.execute(
+                    "UPDATE qc_upload_sessions SET status = 'processing', total = ?, submitted_by = ?, "
+                    "updated_at = ? WHERE instrument_id = ? AND session_id = ?",
+                    (int(total), actor_id, now, instrument_id, session_id),
+                )
+            connection.commit()
+            row = connection.execute(
+                "SELECT * FROM qc_upload_sessions WHERE instrument_id = ? AND session_id = ?",
+                (instrument_id, session_id),
+            ).fetchone()
+            return self._session_from_row(row)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_upload_session(self, instrument_id, session_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM qc_upload_sessions WHERE instrument_id = ? AND session_id = ?",
+                (instrument_id, session_id),
+            ).fetchone()
+        return self._session_from_row(row) if row else None
+
+    def list_upload_sessions(self, instrument_id=None):
+        with self._connect() as connection:
+            if instrument_id:
+                rows = connection.execute(
+                    "SELECT * FROM qc_upload_sessions WHERE instrument_id = ? ORDER BY created_at, session_id",
+                    (instrument_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM qc_upload_sessions ORDER BY created_at, session_id"
+                ).fetchall()
+        return [self._session_from_row(row) for row in rows]
+
+    @staticmethod
+    def _session_from_row(row):
+        return {
+            "instrument_id": row["instrument_id"],
+            "session_id": row["session_id"],
+            "status": row["status"],
+            "total": int(row["total"]),
+            "last_seq": int(row["last_seq"]),
+            "submitted_by": row["submitted_by"],
+            "last_error": row["last_error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_buffer_record(self, instrument_id, session_id, seq):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT run_entity_id, payload_hash FROM qc_buffer_records "
+                "WHERE instrument_id = ? AND session_id = ? AND seq = ?",
+                (instrument_id, session_id, seq),
+            ).fetchone()
+        if not row:
+            return None
+        return {"run_entity_id": row["run_entity_id"], "payload_hash": row["payload_hash"]}
+
+    def insert_buffer_record(self, instrument_id, session_id, seq, entity_id, kind, status, data, actor_id, payload_hash):
+        """Insert one buffered QC run and advance the session checkpoint atomically.
+
+        The primary key on (instrument_id, session_id, seq) together with
+        BEGIN IMMEDIATE makes this a no-op-safe unit of work: retrying after a
+        failure resumes exactly where the previous attempt stopped.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT run_entity_id, payload_hash FROM qc_buffer_records "
+                "WHERE instrument_id = ? AND session_id = ? AND seq = ?",
+                (instrument_id, session_id, seq),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_hash"] != payload_hash:
+                    raise ConflictError(
+                        "buffer record %s/%s#%s was already uploaded with different content"
+                        % (instrument_id, session_id, seq)
+                    )
+                connection.commit()
+                return {"run_entity_id": existing["run_entity_id"], "payload_hash": existing["payload_hash"], "inserted": False}
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                (entity_id, kind, status, payload, actor_id, now, now),
+            )
+            connection.execute(
+                "INSERT INTO qc_buffer_records(instrument_id, session_id, seq, run_entity_id, payload_hash, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (instrument_id, session_id, int(seq), entity_id, payload_hash, now),
+            )
+            connection.execute(
+                "UPDATE qc_upload_sessions SET last_seq = ?, status = 'processing', last_error = NULL, updated_at = ? "
+                "WHERE instrument_id = ? AND session_id = ?",
+                (int(seq), now, instrument_id, session_id),
+            )
+            connection.commit()
+            return {"run_entity_id": entity_id, "payload_hash": payload_hash, "inserted": True}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_upload_session(self, instrument_id, session_id, status, error=None):
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE qc_upload_sessions SET status = ?, last_error = ?, updated_at = ? "
+                "WHERE instrument_id = ? AND session_id = ?",
+                (status, error, utcnow(), instrument_id, session_id),
             )
 
     def ping(self):
